@@ -3,8 +3,16 @@
 # Baseado em .github/workflows/flutter-build.yml, bridge.yml e
 # third-party-RustDeskTempTopMostWindow.yml da tag 1.4.9 do RustDesk, reduzido a
 # Windows x64 (sem ARM64, MSI, Sciter, assinatura de codigo). A unica alteracao no
-# codigo-fonte e o passo "Embutir servidor da JU.KO", que troca as constantes
-# RENDEZVOUS_SERVERS e RS_PUB_KEY de libs/hbb_common/src/config.rs.
+# codigo-fonte e o passo "Embutir servidor da JU.KO", que troca:
+#  - RENDEZVOUS_SERVERS e RS_PUB_KEY de libs/hbb_common/src/config.rs (servidor padrao);
+#  - a chave publica que valida o custom.txt em src/common.rs (por uma chave efemera
+#    gerada neste proprio job, cuja semente nunca sai do runner).
+#
+# Do mesmo binario compilado saem DOIS executaveis, que diferem so pelo custom.txt
+# (mecanismo oficial de "cliente customizado" do RustDesk) ao lado do rustdesk.exe:
+#  - cliente: so mostra o ID; sem Configuracoes, sem card de instalar/UAC, sem aviso de
+#    servidor, servidor travado, aprovacao por clique (nao precisa dar senha);
+#  - agente: interface completa, com o servidor travado e sem os avisos.
 #
 # A chave abaixo e a chave PUBLICA do hbbs (a mesma que qualquer cliente precisa
 # conhecer para se conectar) e nao e segredo.
@@ -14,8 +22,8 @@ on:
   workflow_dispatch:
     inputs:
       release-tag:
-        description: "Tag da release que recebe o instalador"
-        default: "juko-1.4.9"
+        description: "Tag da release que recebe os instaladores"
+        default: "juko-1.4.9-r2"
 
 permissions:
   contents: write
@@ -164,6 +172,21 @@ jobs:
           grep -qF "pub const RENDEZVOUS_SERVERS: &[&str] = &[\"${JUKO_SERVER_HOST}\"];" "$CFG" || { echo "::error::patch do servidor nao aplicou"; exit 1; }
           grep -qF "pub const RS_PUB_KEY: &str = \"${JUKO_SERVER_KEY}\";" "$CFG" || { echo "::error::patch da chave nao aplicou"; exit 1; }
 
+      - name: Trocar a chave que valida o custom.txt por uma chave efemera
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pynacl
+          # imprime SO a chave publica; a semente fica em $RUNNER_TEMP e nunca e publicada
+          JUKO_SIGN_PK="$(python3 .github/juko/gerar_chave.py)"
+          [ "${#JUKO_SIGN_PK}" -eq 44 ] || { echo "::error::chave publica invalida"; exit 1; }
+          echo "JUKO_SIGN_PK=${JUKO_SIGN_PK}" >> "$GITHUB_ENV"
+          COM=src/common.rs
+          sed -i "s|const KEY: &str = \"5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=\";|const KEY: \&str = \"${JUKO_SIGN_PK}\";|" "$COM"
+          grep -n "const KEY: &str" "$COM"
+          grep -qF "const KEY: &str = \"${JUKO_SIGN_PK}\";" "$COM" || { echo "::error::troca da chave do custom.txt nao aplicou"; exit 1; }
+          if grep -q "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=" "$COM"; then echo "::error::chave oficial ainda presente em common.rs"; exit 1; fi
+
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -270,30 +293,55 @@ jobs:
           # o codigo Rust vira librustdesk.dll; se o patch nao chegou nele, o build nao pode ser publicado
           grep -qa "${JUKO_SERVER_HOST}" rustdesk/librustdesk.dll || { echo "::error::servidor ${JUKO_SERVER_HOST} nao esta no binario"; exit 1; }
           grep -qa "${JUKO_SERVER_KEY}" rustdesk/librustdesk.dll || { echo "::error::chave publica nao esta no binario"; exit 1; }
+          # a chave que valida o custom.txt tem de ser a efemera deste build. (Nao da pra exigir a AUSENCIA da chave
+          # oficial: ela aparece em textos de ajuda dos arquivos de idioma, entao sempre esta no binario.)
+          grep -qaF "${JUKO_SIGN_PK}" rustdesk/librustdesk.dll || { echo "::error::chave efemera do custom.txt nao esta no binario"; exit 1; }
           if grep -qa "rs-ny.rustdesk.com" rustdesk/librustdesk.dll; then echo "::warning::ainda ha referencia a rs-ny.rustdesk.com no binario"; fi
-          echo "OK: servidor e chave da JU.KO presentes em librustdesk.dll"
+          echo "OK: servidor, chave e chave de assinatura do custom.txt da JU.KO presentes em librustdesk.dll"
 
-      - name: Build self-extracted executable
+      - name: Gerar custom.txt assinados (cliente e agente)
         shell: bash
         run: |
+          set -euo pipefail
+          python3 .github/juko/gerar_custom.py ./custom-txt
+          ls -l ./custom-txt
+          [ -s ./custom-txt/custom-cliente.txt ] && [ -s ./custom-txt/custom-agente.txt ]
+
+      - name: Build self-extracted executables (cliente e agente)
+        shell: bash
+        run: |
+          set -euo pipefail
           sed -i '/dpiAware/d' res/manifest.xml
-          pushd ./libs/portable
-          pip3 install -r requirements.txt
-          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
-          popd
+          pip3 install -r libs/portable/requirements.txt
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/juko-rustdesk-x64.exe
-          cd SignOutput && sha256sum juko-rustdesk-x64.exe | tee SHA256SUMS.txt && ls -l
+          for variante in cliente agente; do
+            # o RustDesk le custom.txt da pasta do exe; o empacotador leva a pasta inteira
+            cp "./custom-txt/custom-${variante}.txt" ./rustdesk/custom.txt
+            pushd ./libs/portable
+            python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+            popd
+            grep -qa "custom.txt" ./libs/portable/data.bin || { echo "::error::custom.txt nao entrou no pacote (${variante})"; exit 1; }
+            mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/juko-rustdesk-${variante}-x64.exe"
+          done
+          cd SignOutput && sha256sum juko-rustdesk-*-x64.exe | tee SHA256SUMS.txt && ls -l
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           tag_name: ${{ inputs.release-tag }}
-          name: RustDesk ${{ env.VERSION }} - JU.KO (servidor embutido)
+          name: RustDesk ${{ env.VERSION }} - JU.KO (cliente e agente)
           body: |
-            RustDesk ${{ env.VERSION }} (Windows x64, portatil) compilado sem alteracoes de codigo alem da troca do servidor
-            padrao (`RENDEZVOUS_SERVERS`) e da chave publica (`RS_PUB_KEY`) em `libs/hbb_common/src/config.rs`.
-            Codigo-fonte: este repositorio (tag `${{ env.VERSION }}` do RustDesk + `.github/workflows/juko-windows.yml`).
+            RustDesk ${{ env.VERSION }} (Windows x64, portatil) com o servidor da JU.KO embutido. Mesmo binario, dois executaveis
+            que diferem so pelo `custom.txt` assinado (mecanismo oficial de cliente customizado do RustDesk):
+
+            - `juko-rustdesk-cliente-x64.exe`: so mostra o ID; sem Configuracoes, sem card de instalar/UAC, servidor travado,
+              aprovacao por clique (o cliente nao precisa informar senha).
+            - `juko-rustdesk-agente-x64.exe`: interface completa, com o servidor travado e sem os avisos.
+
+            Alteracoes no codigo do RustDesk: `RENDEZVOUS_SERVERS` e `RS_PUB_KEY` (`libs/hbb_common/src/config.rs`) e a chave
+            publica que valida o `custom.txt` (`src/common.rs`, efemera por build). Codigo-fonte: este repositorio (tag `${{ env.VERSION }}`
+            do RustDesk + `.github/workflows/juko-windows.yml` e `.github/juko/`).
           files: |
-            ./SignOutput/juko-rustdesk-x64.exe
+            ./SignOutput/juko-rustdesk-cliente-x64.exe
+            ./SignOutput/juko-rustdesk-agente-x64.exe
             ./SignOutput/SHA256SUMS.txt
