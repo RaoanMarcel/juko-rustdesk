@@ -8,29 +8,47 @@
 #  - a chave publica que valida o custom.txt em src/common.rs (por uma chave efemera
 #    gerada neste proprio job, cuja semente nunca sai do runner).
 #
+# Marca e comportamento do JUKO no codigo (versionado neste repositorio, nao em passos do workflow):
+#  - tema escuro MIDNIGHT do sistema (flutter/lib/common.dart), icones e logo (.github/juko/gerar_icones.py);
+#  - textos "RustDesk" -> "JUKO" so nos VALORES traduzidos (src/lang/ptbr.rs e en.rs);
+#  - juko://pair (flutter/lib/common.dart, jukoPair): o app envia o proprio ID ao sistema JUKO.
+#
 # Do mesmo binario compilado saem DOIS executaveis, que diferem so pelo custom.txt
 # (mecanismo oficial de "cliente customizado" do RustDesk) ao lado do rustdesk.exe:
-#  - cliente: so mostra o ID; sem Configuracoes, sem card de instalar/UAC, sem aviso de
-#    servidor, servidor travado, aprovacao por clique (nao precisa dar senha);
-#  - agente: interface completa, com o servidor travado e sem os avisos.
+#  - juko-suporte-install.exe (cliente): so mostra o ID; sem Configuracoes, sem aviso de servidor,
+#    servidor travado, aprovacao por clique (nao precisa dar senha). O nome terminado em "install.exe"
+#    faz o proprio RustDesk abrir o instalador ao executar (ver src/common.rs::is_setup): instala uma
+#    vez, vira servico e o ID fica fixo;
+#  - juko-agente-install.exe (agente): interface completa, com o servidor travado e sem os avisos.
 #
-# A chave abaixo e a chave PUBLICA do hbbs (a mesma que qualquer cliente precisa
-# conhecer para se conectar) e nao e segredo.
+# Servidor, chave e API NAO ficam no repositorio: entram por entrada (inputs) a cada execucao.
+# A chave do servidor e a chave PUBLICA do hbbs (a mesma que qualquer cliente precisa conhecer para
+# se conectar) e nao e segredo.
 name: JUKO - RustDesk Windows x64
 
 on:
   workflow_dispatch:
     inputs:
+      server-host:
+        description: "Endereco publico do servidor RustDesk (hbbs/hbbr) que fica embutido, sem http(s)://"
+        required: true
+      server-key:
+        description: "Chave publica do hbbs (conteudo de id_ed25519.pub)"
+        required: true
+      api-url:
+        description: "URL publica da API do JUKO que recebe o ID (https://...), a mesma do PUBLIC_API_URL"
+        required: true
       release-tag:
         description: "Tag da release que recebe os instaladores"
-        default: "juko-1.4.9-r2"
+        default: "juko-1.4.9-r3"
 
 permissions:
   contents: write
 
 env:
-  JUKO_SERVER_HOST: "juko.pro4ce.com"
-  JUKO_SERVER_KEY: "3IjiPxcYUyKpOluLRSS1wlkyaFgHnDba6R8sBSmCq4Y="
+  JUKO_SERVER_HOST: ${{ inputs.server-host }}
+  JUKO_SERVER_KEY: ${{ inputs.server-key }}
+  JUKO_API_URL: ${{ inputs.api-url }}
   RUST_VERSION: "1.75"
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
@@ -42,7 +60,25 @@ env:
   VERSION: "1.4.9"
 
 jobs:
+  validar:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Validar entradas (falha cedo, antes de gastar o build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${JUKO_SERVER_HOST}" in
+            ""|localhost*|127.*|*://*|*" "*) echo "::error::server-host invalido (precisa ser um endereco alcancavel por outros computadores, sem http://)"; exit 1;;
+          esac
+          [ "${#JUKO_SERVER_KEY}" -eq 44 ] || { echo "::error::server-key invalida (a chave publica do hbbs tem 44 caracteres)"; exit 1; }
+          case "${JUKO_API_URL}" in
+            https://*) ;;
+            *) echo "::error::api-url precisa comecar com https://"; exit 1;;
+          esac
+          echo "Entradas OK: servidor ${JUKO_SERVER_HOST}, API ${JUKO_API_URL}"
+
   bridge:
+    needs: validar
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source code
@@ -146,7 +182,7 @@ jobs:
 
   build-windows:
     name: windows-x64
-    needs: [bridge, topmost]
+    needs: [validar, bridge, topmost]
     runs-on: windows-2022
     steps:
       - name: Export GitHub Actions cache environment variables
@@ -315,33 +351,35 @@ jobs:
           pip3 install -r libs/portable/requirements.txt
           mkdir -p ./SignOutput
           for variante in cliente agente; do
+            # "install.exe" no fim do nome faz o RustDesk abrir o instalador ao executar
+            case "${variante}" in cliente) arquivo="juko-suporte-install.exe";; agente) arquivo="juko-agente-install.exe";; esac
             # o RustDesk le custom.txt da pasta do exe; o empacotador leva a pasta inteira
             cp "./custom-txt/custom-${variante}.txt" ./rustdesk/custom.txt
             pushd ./libs/portable
             python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
             popd
             grep -qa "custom.txt" ./libs/portable/data.bin || { echo "::error::custom.txt nao entrou no pacote (${variante})"; exit 1; }
-            mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/juko-rustdesk-${variante}-x64.exe"
+            mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/${arquivo}"
           done
-          cd SignOutput && sha256sum juko-rustdesk-*-x64.exe | tee SHA256SUMS.txt && ls -l
+          cd SignOutput && sha256sum juko-*-install.exe | tee SHA256SUMS.txt && ls -l
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           tag_name: ${{ inputs.release-tag }}
-          name: RustDesk ${{ env.VERSION }} - JU.KO (cliente e agente)
+          name: JUKO Suporte ${{ inputs.release-tag }}
           body: |
-            RustDesk ${{ env.VERSION }} (Windows x64, portatil) com o servidor da JU.KO embutido. Mesmo binario, dois executaveis
-            que diferem so pelo `custom.txt` assinado (mecanismo oficial de cliente customizado do RustDesk):
+            JUKO Suporte (base RustDesk ${{ env.VERSION }}, Windows x64) com o servidor do JUKO embutido. Mesmo binario, dois
+            executaveis que diferem so pelo `custom.txt` assinado (mecanismo oficial de cliente customizado do RustDesk):
 
-            - `juko-rustdesk-cliente-x64.exe`: so mostra o ID; sem Configuracoes, sem card de instalar/UAC, servidor travado,
-              aprovacao por clique (o cliente nao precisa informar senha).
-            - `juko-rustdesk-agente-x64.exe`: interface completa, com o servidor travado e sem os avisos.
+            - `juko-suporte-install.exe` (cliente): abre o instalador ao executar (o nome terminado em `install.exe` e o gatilho oficial);
+              instalado, o app fica em segundo plano e o ID passa a ser fixo. Sem Configuracoes, servidor travado, aprovacao por clique.
+            - `juko-agente-install.exe` (agente): interface completa, com o servidor travado e sem os avisos.
 
-            Alteracoes no codigo do RustDesk: `RENDEZVOUS_SERVERS` e `RS_PUB_KEY` (`libs/hbb_common/src/config.rs`) e a chave
-            publica que valida o `custom.txt` (`src/common.rs`, efemera por build). Codigo-fonte: este repositorio (tag `${{ env.VERSION }}`
-            do RustDesk + `.github/workflows/juko-windows.yml` e `.github/juko/`).
+            Alteracoes em relacao ao RustDesk ${{ env.VERSION }}: servidor e chave padrao (`libs/hbb_common/src/config.rs`), chave que valida o
+            `custom.txt` (`src/common.rs`, efemera por build), tema/icones/textos e o link `juko://pair` (`flutter/lib/common.dart`).
+            Codigo-fonte completo: este repositorio (licenca AGPL-3.0, igual ao RustDesk).
           files: |
-            ./SignOutput/juko-rustdesk-cliente-x64.exe
-            ./SignOutput/juko-rustdesk-agente-x64.exe
+            ./SignOutput/juko-suporte-install.exe
+            ./SignOutput/juko-agente-install.exe
             ./SignOutput/SHA256SUMS.txt
